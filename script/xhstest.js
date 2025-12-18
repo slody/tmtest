@@ -478,6 +478,7 @@ if (url.includes("/api/sns/v5/note/comment/list?") || url.includes("/api/sns/v3/
   
   replaceRedIdWithFmz200(obj.data);
   let livePhotos = [];
+  let commentImages = []; // 新增：缓存普通图片
   let note_id = "";
   
   if (obj.data?.comments?.length > 0) {
@@ -485,17 +486,40 @@ if (url.includes("/api/sns/v5/note/comment/list?") || url.includes("/api/sns/v3/
     
     for (const comment of obj.data.comments) {
       try {
-        // 修复评论类型
-        if (comment.comment_type === 3) {
-          comment.comment_type = 2;
+        // ⚠️ 不再强制修改评论类型，让App正确识别
+        // 只有当确实有图片时才处理
+        const hasPictures = comment.pictures?.length > 0;
+        const hasLivePhoto = hasPictures && comment.pictures.some(p => p.video_id);
+        
+        // 如果是纯图片评论（非Live Photo），保持原类型
+        if (hasPictures && !hasLivePhoto && comment.comment_type === 2) {
+          // 不修改，保持为图片类型
+          console.log(`保持图片评论类型: comment_id=${comment.id}`);
+        } else if (comment.comment_type === 3) {
+          // 表情包：不修改类型，避免下载失败
+          console.log(`跳过表情包: comment_id=${comment.id}`);
+          continue; // 跳过表情包的处理
         }
-        if (comment.media_source_type === 1) {
-          comment.media_source_type = 0;
-        }
+        
+        // media_source_type 谨慎修改
+        // if (comment.media_source_type === 1) {
+        //   comment.media_source_type = 0;
+        // }
         
         // 提取Live Photo
         if (comment.pictures?.length > 0) {
           for (const picture of comment.pictures) {
+            // 缓存普通图片URL
+            if (picture.url && !picture.video_id) {
+              commentImages.push({
+                url: picture.url,
+                url_default: picture.url_default,
+                comment_id: comment.id
+              });
+              console.log(`📸 缓存普通图片: ${picture.url.substring(0, 50)}...`);
+            }
+            
+            // 提取Live Photo
             if (picture.video_id && picture.video_info) {
               try {
                 const picObj = JSON.parse(picture.video_info);
@@ -504,6 +528,7 @@ if (url.includes("/api/sns/v5/note/comment/list?") || url.includes("/api/sns/v3/
                     videId: picture.video_id,
                     videoUrl: picObj.stream.h265[0].master_url
                   });
+                  console.log(`🎬 缓存Live Photo: ${picture.video_id}`);
                 }
               } catch (e) {
                 console.log(`⚠️ 解析video_info失败: ${e}`);
@@ -515,15 +540,27 @@ if (url.includes("/api/sns/v5/note/comment/list?") || url.includes("/api/sns/v3/
         // 处理子评论
         if (comment.sub_comments?.length > 0) {
           for (const sub_comment of comment.sub_comments) {
+            // 同样的逻辑处理子评论
+            const hasPictures = sub_comment.pictures?.length > 0;
+            const hasLivePhoto = hasPictures && sub_comment.pictures.some(p => p.video_id);
+            
             if (sub_comment.comment_type === 3) {
-              sub_comment.comment_type = 2;
-            }
-            if (sub_comment.media_source_type === 1) {
-              sub_comment.media_source_type = 0;
+              console.log(`跳过子评论表情包: comment_id=${sub_comment.id}`);
+              continue;
             }
             
             if (sub_comment.pictures?.length > 0) {
               for (const picture of sub_comment.pictures) {
+                // 缓存普通图片
+                if (picture.url && !picture.video_id) {
+                  commentImages.push({
+                    url: picture.url,
+                    url_default: picture.url_default,
+                    comment_id: sub_comment.id
+                  });
+                }
+                
+                // 提取Live Photo
                 if (picture.video_id && picture.video_info) {
                   try {
                     const picObj = JSON.parse(picture.video_info);
@@ -547,13 +584,17 @@ if (url.includes("/api/sns/v5/note/comment/list?") || url.includes("/api/sns/v3/
     }
   }
   
-  // 缓存Live Photos
-  if (livePhotos.length > 0) {
+  // 缓存Live Photos + 普通图片
+  if (livePhotos.length > 0 || commentImages.length > 0) {
     let commitsRsp;
     const commitsCache = $.getdata("fmz200.xiaohongshu.comments.rsp");
     
     if (!commitsCache) {
-      commitsRsp = {noteId: note_id, livePhotos: livePhotos};
+      commitsRsp = {
+        noteId: note_id, 
+        livePhotos: livePhotos,
+        images: commentImages
+      };
     } else {
       try {
         commitsRsp = JSON.parse(commitsCache);
@@ -561,21 +602,30 @@ if (url.includes("/api/sns/v5/note/comment/list?") || url.includes("/api/sns/v3/
         if (commitsRsp.noteId === note_id) {
           // 增量添加并去重
           commitsRsp.livePhotos = deduplicateLivePhotos(
-            commitsRsp.livePhotos.concat(livePhotos)
+            (commitsRsp.livePhotos || []).concat(livePhotos)
           );
+          commitsRsp.images = (commitsRsp.images || []).concat(commentImages);
           console.log('📝 增量更新评论缓存');
         } else {
           // 更换笔记
-          commitsRsp = {noteId: note_id, livePhotos: livePhotos};
+          commitsRsp = {
+            noteId: note_id, 
+            livePhotos: livePhotos,
+            images: commentImages
+          };
           console.log('📝 更新评论缓存（新笔记）');
         }
       } catch (e) {
-        commitsRsp = {noteId: note_id, livePhotos: livePhotos};
+        commitsRsp = {
+          noteId: note_id, 
+          livePhotos: livePhotos,
+          images: commentImages
+        };
       }
     }
     
     $.setdata(JSON.stringify(commitsRsp), "fmz200.xiaohongshu.comments.rsp");
-    console.log(`✅ 缓存了 ${livePhotos.length} 个评论Live Photo`);
+    console.log(`✅ 缓存了 ${livePhotos.length} 个Live Photo + ${commentImages.length} 张普通图片`);
   }
 }
 
@@ -608,6 +658,37 @@ if (url.includes("/api/sns/v1/interaction/comment/video/download?")) {
       }
     } catch (e) {
       console.error('❌ 处理评论视频失败: ' + e);
+    }
+  }
+}
+
+// ================== 下载评论区普通图片（新增） ==================
+if (url.includes("/api/sns/v1/note/imagefeed") || url.includes("/api/sns/v2/note/feed/")) {
+  console.log('💾 处理评论区图片保存');
+  
+  // 这个接口也会返回评论区的图片，需要特殊处理
+  const commitsCache = $.getdata("fmz200.xiaohongshu.comments.rsp");
+  
+  if (commitsCache && obj.data?.items) {
+    try {
+      const commitsRsp = JSON.parse(commitsCache);
+      
+      if (commitsRsp.images?.length > 0) {
+        // 尝试匹配并增强评论区图片
+        for (let item of obj.data.items) {
+          if (item.images_list) {
+            for (let image of item.images_list) {
+              // 提升图片质量
+              if (image.url) {
+                image.url = enhanceImageQuality(image.url);
+                console.log('✅ 增强评论区图片质量');
+              }
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.error('❌ 处理评论区图片失败: ' + e);
     }
   }
 }
@@ -717,6 +798,34 @@ function replaceRedIdWithFmz200(obj) {
     Object.keys(obj).forEach(key => {
       replaceRedIdWithFmz200(obj[key]);
     });
+  }
+}
+
+// 单个URL的画质增强
+function enhanceImageQuality(imageUrl) {
+  if (!imageUrl || typeof imageUrl !== 'string') {
+    return imageUrl;
+  }
+  
+  const imageQuality = $.getdata("fmz200.xiaohongshu.imageQuality");
+  
+  try {
+    if (imageQuality === "original") {
+      // 原始质量
+      return imageUrl.replace(
+        /\?imageView2\/2[^&"]*(?:&redImage\/frame\/0)?/,
+        "?imageView2/0/format/png"
+      );
+    } else {
+      // 2K质量
+      return imageUrl.replace(
+        /(imageView2\/2\/[wh])\/\d+/g,
+        "$1/2160"
+      );
+    }
+  } catch (e) {
+    console.error('❌ enhanceImageQuality 失败: ' + e);
+    return imageUrl;
   }
 }
 
